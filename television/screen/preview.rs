@@ -1,0 +1,252 @@
+use crate::{
+    config::layers::MergedConfig,
+    event::Key,
+    previewer::state::PreviewState,
+    screen::{
+        colors::Colorscheme,
+        layout::{preview_hairline, preview_pane_block},
+    },
+    utils::strings::{
+        ReplaceNonPrintableConfig, SPACE, replace_non_printable_bulk,
+        shrink_with_ellipsis,
+    },
+};
+use anyhow::Result;
+use ratatui::{
+    Frame,
+    layout::{Alignment, Rect},
+    prelude::{Color, Line, Span, Style, Text},
+    widgets::{
+        Block, Borders, Clear, Padding as RatatuiPadding, Paragraph,
+        Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
+    },
+};
+
+pub fn draw_preview_content_block(
+    f: &mut Frame,
+    rect: Rect,
+    preview_state: PreviewState,
+    colorscheme: &Colorscheme,
+    config: &MergedConfig,
+    cycle_key: Option<Key>,
+) -> Result<()> {
+    let scrollbar = config.preview_panel_scrollbar;
+    let total_lines =
+        preview_state.preview.total_lines.saturating_sub(1) as usize;
+    let scroll = preview_state.scroll;
+
+    // minimal UI: a dimmed percentage in the title row stands in for the
+    // scrollbar, only once the preview is actually scrolled
+    let scroll_percent = if scrollbar || scroll == 0 {
+        None
+    } else {
+        let total = u32::try_from(total_lines.max(1)).unwrap_or(u32::MAX);
+        Some(
+            u8::try_from((u32::from(scroll) * 100 / total).min(100))
+                .expect("percentage always fits in u8"),
+        )
+    };
+
+    let inner = draw_content_outer_block(
+        f,
+        rect,
+        colorscheme,
+        config,
+        &preview_state.preview.title,
+        preview_state.preview.footer,
+        preview_state.preview.preview_index,
+        preview_state.preview.preview_count,
+        cycle_key,
+        scroll_percent,
+    );
+
+    // render the preview content
+    // the render context's `Arc` is not shared, so this is a move, not a copy
+    let content = std::sync::Arc::try_unwrap(preview_state.preview.content)
+        .unwrap_or_else(|arc| (*arc).clone());
+    let rp = build_preview_paragraph(
+        content,
+        preview_state.preview.target_line,
+        colorscheme.preview.highlight_bg,
+        config.preview_panel_word_wrap,
+    );
+    f.render_widget(Clear, inner);
+    f.render_widget(rp, inner);
+
+    // render scrollbar if enabled
+    if scrollbar {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(colorscheme.general.border_fg));
+
+        let mut scrollbar_state =
+            ScrollbarState::new(total_lines).position(scroll as usize);
+
+        // Create a separate area for the scrollbar that accounts for text padding
+        let scrollbar_rect = Rect {
+            x: inner.x + inner.width,
+            y: inner.y,
+            width: 1, // Scrollbar width
+            height: inner.height,
+        };
+
+        scrollbar.render(scrollbar_rect, f.buffer_mut(), &mut scrollbar_state);
+    }
+
+    Ok(())
+}
+
+pub fn build_preview_paragraph(
+    mut text: Text<'static>,
+    target_line: Option<u16>,
+    highlight_bg: Color,
+    word_wrap: bool,
+) -> Paragraph<'static> {
+    // Highlight the target line
+    if let Some(target_line) = target_line
+        && let Some(line) =
+            text.lines.get_mut((target_line.saturating_sub(1)) as usize)
+    {
+        for span in &mut line.spans {
+            span.style = span.style.bg(highlight_bg);
+        }
+    }
+
+    let preview_block =
+        Block::default()
+            .style(Style::default())
+            .padding(RatatuiPadding {
+                top: 0,
+                right: 1,
+                bottom: 0,
+                left: 1,
+            });
+
+    let paragraph = Paragraph::new(text).block(preview_block);
+
+    if word_wrap {
+        paragraph.wrap(ratatui::widgets::Wrap { trim: true })
+    } else {
+        paragraph
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_content_outer_block(
+    f: &mut Frame,
+    rect: Rect,
+    colorscheme: &Colorscheme,
+    config: &MergedConfig,
+    preview_title: &str,
+    preview_footer: Option<String>,
+    preview_index: usize,
+    preview_count: usize,
+    cycle_key: Option<Key>,
+    scroll_percent: Option<u8>,
+) -> Rect {
+    let (indicator, key_hint) = if preview_count > 1 {
+        let dots: String = (0..preview_count)
+            .map(|i| if i == preview_index { "●" } else { "○" })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let hint = cycle_key.map(|k| format!(" {}", k)).unwrap_or_default();
+        (format!(" ⟨ {} ⟩", dots), hint)
+    } else {
+        (String::new(), String::new())
+    };
+    let indicator_len = u16::try_from(indicator.chars().count()).unwrap_or(0);
+    let key_hint_len = u16::try_from(key_hint.chars().count()).unwrap_or(0);
+
+    let mut preview_title_spans = vec![Span::from(SPACE)];
+    // preview header
+    preview_title_spans.push(Span::styled(
+        shrink_with_ellipsis(
+            &replace_non_printable_bulk(
+                preview_title,
+                &ReplaceNonPrintableConfig::default(),
+            )
+            .0,
+            rect.width.saturating_sub(4 + indicator_len + key_hint_len)
+                as usize,
+        ),
+        Style::default().fg(colorscheme.preview.title_fg).bold(),
+    ));
+
+    if preview_count > 1 {
+        preview_title_spans.push(Span::styled(
+            indicator,
+            Style::default().fg(colorscheme.input.results_count_fg),
+        ));
+        if !key_hint.is_empty() {
+            preview_title_spans.push(Span::styled(
+                key_hint,
+                Style::default().fg(colorscheme.general.border_fg),
+            ));
+        }
+    }
+    preview_title_spans.push(Span::from(SPACE));
+
+    let hairline = preview_hairline(config);
+    let borderless = hairline.is_some();
+    // without a border to anchor them, titles read better left-aligned
+    let title_alignment = if borderless {
+        Alignment::Left
+    } else {
+        Alignment::Center
+    };
+
+    // ratatui draws titles on the border row: with a horizontal hairline the
+    // title embeds into the line, so lead with a line segment instead of a
+    // bare space (`─ title ───` rather than ` title ───`)
+    let embeds_into =
+        |side: Borders| hairline.is_some_and(|h| h.contains(side));
+    let hairline_style = Style::default().fg(colorscheme.general.border_fg);
+
+    if embeds_into(Borders::TOP) {
+        preview_title_spans.insert(0, Span::styled("─", hairline_style));
+    }
+
+    let mut block = preview_pane_block(config, colorscheme).title_top(
+        Line::from(preview_title_spans)
+            .alignment(title_alignment)
+            .style(Style::default().fg(colorscheme.preview.title_fg)),
+    );
+
+    // borderless preview: dimmed scroll percentage on the right of the
+    // title row, standing in for the scrollbar
+    if borderless && let Some(percent) = scroll_percent {
+        let mut percent_spans = vec![Span::styled(
+            format!(" {}% ", percent),
+            Style::default()
+                .fg(colorscheme.general.dimmed_text_fg)
+                .italic(),
+        )];
+        if embeds_into(Borders::TOP) {
+            percent_spans.push(Span::styled("─", hairline_style));
+        }
+        block = block
+            .title_top(Line::from(percent_spans).alignment(Alignment::Right));
+    }
+
+    // preview footer
+    if let Some(preview_footer) = preview_footer {
+        let mut footer_spans = vec![
+            Span::from(SPACE),
+            Span::from(preview_footer),
+            Span::from(SPACE),
+        ];
+        if embeds_into(Borders::BOTTOM) {
+            footer_spans.insert(0, Span::styled("─", hairline_style));
+        }
+        let footer_line = Line::from(footer_spans)
+            .alignment(title_alignment)
+            .style(Style::default().fg(colorscheme.preview.title_fg));
+        block = block.title_bottom(footer_line);
+    }
+
+    let preview_outer_block =
+        block.padding(RatatuiPadding::from(config.preview_panel_padding));
+
+    let inner = preview_outer_block.inner(rect);
+    f.render_widget(preview_outer_block, rect);
+    inner
+}

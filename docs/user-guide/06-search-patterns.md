@@ -1,0 +1,49 @@
+# Search Patterns
+
+Tv uses a fuzzy matching algorithm to filter its list of entries. Its behavior depends on the input pattern you provide.
+
+| Matcher   |           Pattern            |
+| --------- | :--------------------------: |
+| Fuzzy     |            `foo`             |
+| Substring |  `'foo` / `!foo` to negate   |
+| Prefix    |  `^foo` / `!^foo` to negate  |
+| Suffix    |  `foo$` / `!foo$` to negate  |
+| Exact     | `^foo$` / `!^foo$` to negate |
+
+These patterns (and matchers) can be associated (as "AND") to express complex search queries such as:
+
+```
+car 'bike !^car !bike$
+```
+
+which translates to:
+
+```
+anything that:
+- fuzzy matches `car`
+- contains the exact substring `bike`
+- does not start with `car`
+- does not end with `bike`
+```
+
+And will produce the following results:
+| haystack | match | explanation |
+| :------- | :---: | :------: |
+| _the car drove past the bike_ | ✗ | ends with bike |
+| _car, bike or bus?_ | ✗ | starts with car |
+| _the black motorbike flew past the tourists_ | ✓ | |
+| _the motorbike flew past the tourists_ | ✗ | doesn't contain 'car' |
+
+When running with `--exact`, bare patterns match as substrings instead of
+fuzzily (`foo` behaves like `'foo`); all the operators above keep their
+meaning. Prefix a special character with a backslash to search for it
+literally (e.g. `\^foo`, `foo\$`, `foo\ bar`).
+
+With `--typo-resistance` (alias `--typos`, or `typo_resistance = true` in
+the config file),
+fuzzy patterns tolerate typos: each pattern gets a budget of one typo per 4
+characters, capped at 2, so `confg` still matches _config_. Typo'd matches
+score below clean ones, and substring/exact operators are unaffected.
+
+For more information on the matcher behavior, see the
+[frizbee](https://docs.rs/frizbee/latest/frizbee/) documentation.
